@@ -267,6 +267,9 @@ def is_micropython_usb_device(port):
     # Check for LEGO Technic Large Hub
     if usb_id.startswith('usb vid:pid=0694:0010'):
         return True
+    # Check for Quectel modules running QuecPython (EC200U, EC21, EG21, …)
+    if usb_id.startswith('usb vid:pid=2c7c:'):
+        return True
     return False
 
 
@@ -729,7 +732,10 @@ def eval_str(string):
 
 def get_vfs_stats(filename):
     """Returns filesystem statistics."""
-    import os
+    try:
+        import uos as os
+    except ImportError:
+        import os
     try:
         return os.statvfs(filename)
     except OSError:
@@ -738,7 +744,10 @@ def get_vfs_stats(filename):
 
 def get_filesize(filename):
     """Returns the size of a file, in bytes."""
-    import os
+    try:
+        import uos as os
+    except ImportError:
+        import os
     try:
         # Since this function runs remotely, it can't depend on other functions,
         # so we can't call stat_mode.
@@ -751,7 +760,10 @@ def get_mode(filename):
     """Returns the mode of a file, which can be used to determine if a file
        exists, if a file is a file or a directory.
     """
-    import os
+    try:
+        import uos as os
+    except ImportError:
+        import os
     try:
         # Since this function runs remotely, it can't depend on other functions,
         # so we can't call stat_mode.
@@ -763,7 +775,10 @@ def get_mode(filename):
 def lstat(filename):
     """Returns os.lstat for a given file, adjusting the timestamps as appropriate.
        This function will not follow symlinks."""
-    import os
+    try:
+        import uos as os
+    except ImportError:
+        import os
     try:
         # on the host, lstat won't try to follow symlinks
         rstat = os.lstat(filename)
@@ -779,7 +794,10 @@ def lstat(filename):
 
 def stat(filename):
     """Returns os.stat for a given file, adjusting the timestamps as appropriate."""
-    import os
+    try:
+        import uos as os
+    except ImportError:
+        import os
     rstat = os.stat(filename)
     return rstat[:7] + tuple(tim + TIME_OFFSET for tim in rstat[7:])
 
@@ -787,7 +805,10 @@ def stat(filename):
 def sysname():
     """Returns the os.uname().sysname field."""
     try:
-        import os
+        try:
+            import uos as os
+        except ImportError:
+            import os
         return repr(os.uname().sysname)
     except:
         return repr('unknown')
@@ -822,7 +843,10 @@ def get_lstat(filename):
 
 def listdir(dirname):
     """Returns a list of filenames contained in the named directory."""
-    import os
+    try:
+        import uos as os
+    except ImportError:
+        import os
     return os.listdir(dirname)
 
 
@@ -831,7 +855,10 @@ def listdir_matches(match):
        Only filenames which start with `match` will be returned.
        Directories will have a trailing slash.
     """
-    import os
+    try:
+        import uos as os
+    except ImportError:
+        import os
     last_slash = match.rfind('/')
     if last_slash == -1:
         dirname = '.'
@@ -867,7 +894,10 @@ def listdir_lstat(dirname, show_hidden=True):
        contains the filename, followed by the tuple returned by
        calling os.stat on the filename.
     """
-    import os
+    try:
+        import uos as os
+    except ImportError:
+        import os
     try:
         files = os.listdir(dirname)
     except OSError:
@@ -884,7 +914,10 @@ def listdir_stat(dirname, show_hidden=True):
        contains the filename, followed by the tuple returned by
        calling os.stat on the filename.
     """
-    import os
+    try:
+        import uos as os
+    except ImportError:
+        import os
     try:
         files = os.listdir(dirname)
     except OSError:
@@ -896,7 +929,10 @@ def listdir_stat(dirname, show_hidden=True):
 
 def make_directory(dirname):
     """Creates one or more directories."""
-    import os
+    try:
+        import uos as os
+    except ImportError:
+        import os
     try:
         os.mkdir(dirname)
     except:
@@ -911,7 +947,10 @@ def mkdir(filename):
 
 def remove_file(filename, recursive=False, force=False):
     """Removes a file or directory."""
-    import os
+    try:
+        import uos as os
+    except ImportError:
+        import os
     try:
         mode = os.stat(filename)[0]
         if mode & 0x4000 != 0:
@@ -1110,7 +1149,10 @@ def recv_file_from_host(src_file, dst_filename, filesize, dst_mode='wb'):
         import ubinascii
     except:
         import binascii as ubinascii
-    import os
+    try:
+        import uos as os
+    except ImportError:
+        import os
     if HAS_BUFFER:
         try:
             import micropython
@@ -1554,6 +1596,16 @@ class Device(object):
                 raise ShellError('rshell needs MicroPython firmware with ubinascii.unhexlify')
         QUIET or print('Retrieving root directories ... ', end='', flush=True)
         self.root_dirs = ['/{}/'.format(dir) for dir in self.remote_eval(listdir, '/')]
+        # QuecPython: the root listing may be empty or unhelpful because the
+        # filesystem is not mounted at '/'.  If we got no usable root dirs,
+        # probe the known QuecPython mount points (/usr = internal flash,
+        # /sd = SD card) and use whichever exist.
+        if not self.root_dirs:
+            QUIET or print('(root empty, probing QuecPython mounts)', end='', flush=True)
+            for candidate in ('/usr/', '/sd/'):
+                probe = self.remote_eval(get_mode, candidate.rstrip('/'))
+                if probe and (probe & 0x4000):   # S_IFDIR
+                    self.root_dirs.append(candidate)
         QUIET or print(' '.join(self.root_dirs))
         QUIET or print('Setting time ... ', end='', flush=True)
         now = self.sync_time()
@@ -1791,6 +1843,29 @@ class DeviceSerial(Device):
             QUIET or print(' connected', flush=True)
         else:
             raise DeviceError('Unable to connect to REPL')
+
+        # Probe implementation name so we can configure pyb.quecpython before
+        # Device.__init__ calls enter_raw_repl() for the first time.
+        # We do a minimal raw-REPL exchange here, before the soft-reboot path.
+        try:
+            pyb.serial.write(b'\r\x01')  # ctrl-A: raw REPL
+            impl_probe = pyb.read_until(1, b'>', timeout=3)
+            if impl_probe.endswith(b'>'):
+                pyb.serial.write(
+                    b"import sys\nprint(getattr(sys.implementation,'name','?'))\r\n\x04"
+                )
+                impl_resp = pyb.read_until(1, b'\x04', timeout=5)
+                if b'quecpython' in impl_resp.lower():
+                    pyb.quecpython = True
+            pyb.serial.write(b'\r\x02')  # ctrl-B: back to friendly REPL
+            time.sleep(0.1)
+            # flush
+            n = pyb.serial.inWaiting()
+            while n > 0:
+                pyb.serial.read(n)
+                n = pyb.serial.inWaiting()
+        except Exception:
+            pass  # probe failed — leave quecpython=False, proceed normally
 
         # In theory the serial port is now ready to use
         Device.__init__(self, pyb)
@@ -3095,6 +3170,13 @@ def real_main():
         default=False
     )
     parser.add_argument(
+        "--quecpython", "-q",
+        dest="quecpython",
+        action="store_true",
+        help="Force QuecPython mode: skip DTR, probe /usr and /sd as root dirs",
+        default=False
+    )
+    parser.add_argument(
         "cmd",
         nargs=argparse.REMAINDER,
         help="Optional command to execute"
@@ -3148,6 +3230,16 @@ def real_main():
     ASCII_XFER = args.ascii_xfer
     RTS = args.rts
     DTR = args.dtr
+
+    if args.quecpython:
+        # QuecPython devices communicate over a plain UART-style CDC-ACM port.
+        # Force ASCII transfer mode (the default binary xfer uses stdin.buffer
+        # which can get confused by the extra boot messages QuecPython emits).
+        ASCII_XFER = True
+        # Suppress DTR/RTS toggling (already handled in pyboard._open_serial_no_dtr,
+        # but make sure the global overrides are also neutral).
+        RTS = ''
+        DTR = ''
 
     if args.list:
         listports()

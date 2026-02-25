@@ -37,6 +37,7 @@ Or:
 
 """
 
+import os
 import sys
 import time
 
@@ -127,35 +128,159 @@ class Pyboard:
         else:
             import serial
             delayed = False
-            if serial.VERSION == '3.0':
-                self.serial = serial.Serial(baudrate=baudrate, inter_byte_timeout=1, timeout=0.5)
-            else:
-                self.serial = serial.Serial(baudrate=baudrate, interCharTimeout=1, timeout=0.5)
-            if rts != '':
-                self.serial.rts = parse_bool(rts)
-            if dtr != '':
-                self.serial.dtr = parse_bool(dtr)
-            self.serial.port = device
+            # QuecPython: Quectel CDC-ACM REPL ports reject the TIOCMBIS ioctl
+            # that pyserial issues to assert DTR inside serial.open(), raising
+            # BrokenPipeError.  Use a DTR-safe open path for all serial devices.
+            try:
+                self.serial = Pyboard._open_serial_no_dtr(device, baudrate, rts, dtr)
+            except Exception as e:
+                raise PyboardError('failed to access {}: {}'.format(device, e))
             for attempt in range(wait + 1):
-                try:
-                    # Assigning the port attribute will attempt to open the port
-                    self.serial.open()
+                if self.serial.is_open:
                     break
-                except (OSError, IOError): # Py2 and Py3 have different errors
-                    if wait == 0:
-                        continue
-                    if attempt == 0:
-                        sys.stdout.write('Waiting {} seconds for pyboard '.format(wait))
-                        delayed = True
                 time.sleep(1)
                 sys.stdout.write('.')
                 sys.stdout.flush()
             else:
-                if delayed:
-                    print('')
                 raise PyboardError('failed to access ' + device)
             if delayed:
                 print('')
+        # Flag set by DeviceSerial after board identification to suppress
+        # the soft-reboot step in enter_raw_repl() for QuecPython boards.
+        self.quecpython = False
+
+    @staticmethod
+    def _open_serial_no_dtr(device, baudrate, rts='', dtr=''):
+        """Open a serial port without asserting DTR/RTS modem-control lines.
+
+        pyserial's Serial.open() unconditionally calls _update_dtr_state()
+        which issues a TIOCMBIS ioctl.  Quectel (QuecPython) USB CDC-ACM
+        REPL ports do not implement modem-control signals and respond with
+        EPIPE (BrokenPipeError), making the port unusable via the normal path.
+
+        Work-around: open the file descriptor ourselves with O_NOCTTY (so the
+        kernel never assigns modem-control responsibility to this process), set
+        CLOCAL in cflag (so the tty driver ignores modem status lines), and
+        wrap the raw fd in a duck-typed object that satisfies all of pyboard's
+        serial access patterns without involving pyserial's open() at all.
+
+        For non-Quectel boards the rts/dtr parameters are honoured after open
+        via explicit ioctl, matching the previous behaviour.
+        """
+        import fcntl, termios, array, serial
+
+        fd = os.open(device, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        # Switch back to blocking now that the fd is open and DCD was never
+        # sampled (O_NONBLOCK prevents blocking on open for devices that assert
+        # carrier-detect, e.g. real RS-232 modems).
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl & ~os.O_NONBLOCK)
+
+        try:
+            attrs = list(termios.tcgetattr(fd))
+            attrs[0] = 0                              # iflag: no input processing
+            attrs[1] = 0                              # oflag: no output processing
+            attrs[2] = (termios.CS8 |                 # cflag: 8 data bits
+                        termios.CREAD |               #        receiver on
+                        termios.CLOCAL)               #        ignore modem lines
+            attrs[3] = 0                              # lflag: raw
+            baud_const = getattr(termios, 'B{}'.format(baudrate), termios.B115200)
+            attrs[4] = baud_const                     # ispeed
+            attrs[5] = baud_const                     # ospeed
+            cc = list(attrs[6])
+            cc[termios.VMIN]  = 1
+            cc[termios.VTIME] = 0
+            attrs[6] = cc
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        except termios.error as e:
+            os.close(fd)
+            raise serial.SerialException('tcsetattr failed on {}: {}'.format(device, e))
+
+        # Honour explicit rts/dtr overrides now that the fd is safely open.
+        # TIOCMBIS/TIOCMBIC are safe at this point because CLOCAL is set.
+        if rts != '':
+            import struct
+            TIOCMGET = 0x5415
+            TIOCMBIS = 0x5416
+            TIOCMBIC = 0x5417
+            TIOCM_RTS = 0x004
+            buf = struct.pack('I', 0)
+            fcntl.ioctl(fd, TIOCMBIS if parse_bool(rts) else TIOCMBIC,
+                        struct.pack('I', TIOCM_RTS))
+        if dtr != '':
+            import struct
+            TIOCMBIS = 0x5416
+            TIOCMBIC = 0x5417
+            TIOCM_DTR = 0x002
+            fcntl.ioctl(fd, TIOCMBIS if parse_bool(dtr) else TIOCMBIC,
+                        struct.pack('I', TIOCM_DTR))
+
+        class _RawSerial:
+            """Duck-typed serial port backed by a raw fd.
+
+            Implements exactly the interface used by Pyboard and DeviceSerial:
+            read(), write(), inWaiting(), close(), is_open, timeout.
+            Also provides fileno() so the object works with select().
+            """
+            def __init__(self):
+                self._fd     = fd
+                self.is_open = True
+                self.timeout = 0.5
+
+            def fileno(self):
+                return self._fd
+
+            def read(self, size=1):
+                import select as _select
+                buf = b''
+                deadline = time.time() + (self.timeout or 0.5)
+                while len(buf) < size:
+                    r, _, _ = _select.select([self._fd], [], [],
+                                             max(0, deadline - time.time()))
+                    if r:
+                        chunk = os.read(self._fd, size - len(buf))
+                        if chunk:
+                            buf += chunk
+                    else:
+                        break  # timeout
+                return buf
+
+            def write(self, data):
+                data = bytes(data)
+                total = 0
+                while total < len(data):
+                    total += os.write(self._fd, data[total:])
+                return total
+
+            def inWaiting(self):
+                buf = array.array('i', [0])
+                fcntl.ioctl(self._fd, termios.FIONREAD, buf)
+                return buf[0]
+
+            # pyserial 3.x compatibility alias
+            @property
+            def in_waiting(self):
+                return self.inWaiting()
+
+            def flush(self):
+                termios.tcdrain(self._fd)
+
+            def flushInput(self):
+                termios.tcflush(self._fd, termios.TCIFLUSH)
+
+            # pyserial 3.x alias
+            def reset_input_buffer(self):
+                self.flushInput()
+
+            def close(self):
+                if self.is_open:
+                    try:
+                        os.close(self._fd)
+                    except OSError:
+                        pass
+                    self.is_open = False
+
+        return _RawSerial()
 
     def close(self):
         self.serial.close()
@@ -195,6 +320,17 @@ class Pyboard:
         if not data.endswith(b'raw REPL; CTRL-B to exit\r\n>'):
             print(data)
             raise PyboardError('could not enter raw repl')
+
+        if self.quecpython:
+            # QuecPython does not support soft reboot (ctrl-D in raw REPL mode
+            # executes an empty buffer and returns immediately with \x04\x04>
+            # rather than triggering a reboot).  Skip the reboot handshake and
+            # consume only the prompt that is already waiting.
+            n = self.serial.inWaiting()
+            while n > 0:
+                self.serial.read(n)
+                n = self.serial.inWaiting()
+            return
 
         self.serial.write(b'\x04') # ctrl-D: soft reset
         data = self.read_until(1, b'soft reboot\r\n')
